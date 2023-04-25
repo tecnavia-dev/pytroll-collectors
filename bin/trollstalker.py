@@ -31,7 +31,10 @@ import pyinotify
 import sys
 import time
 from six.moves.configparser import RawConfigParser
-import ConfigParser
+try:
+    import configparser as ConfigParser
+except ImportError:
+    import ConfigParser
 import logging
 import logging.config
 import os
@@ -144,6 +147,12 @@ class EventHandler(ProcessEvent):
                 LOGGER.warning("Dir {} not watched by inotify. Can not delete watch.".format(event.pathname))
         return
 
+    def sort_epilog(self, elem):
+        mod_time = os.path.getmtime(elem)
+        if elem.lower().find("epi") != -1:
+            mod_time += 3600
+        return mod_time
+
     def process(self, event):
         '''Process the event
 
@@ -176,24 +185,36 @@ class EventHandler(ProcessEvent):
                         filter_ref = ref_file_content["REF"]["filter"]
                     else:
                         filter_ref = ".*"
-                    for file in os.listdir(scan_path):
-                        # scan all files in referenced folder and generate messages for all the files
-                        if not os.path.isdir(file) and re.search(filter_ref, file):
-                            event_new = event
-                            event_new.name = file
-                            event_new.path = scan_path
-                            event_new.pathname = scan_path + "/" + file
-                            self.parse_file_info(event_new)
-                            if len(self.info) > 0:
-                                # Check if this file has been recently dealt with
-                                if event_new.pathname not in self._deque:
-                                    self._deque.append(event_new.pathname)
-                                    message = self.create_message()
-                                    LOGGER.info("Publishing message %s", str(message))
-                                    self.pub.send(str(message))
-                                else:
-                                    LOGGER.info("Data has been published recently, skipping.")
-                            self.__clean__()
+
+                    # scan all files in referenced folder and generate messages for all the files
+                    list_raw = [os.path.join(scan_path, f) for f in os.listdir(scan_path) if os.path.isfile(os.path.join(scan_path, f)) and re.search(filter_ref, f)]
+                    list_raw = sorted(list_raw, key=self.sort_epilog)
+                    info_multiple = OrderedDict()
+                    cnt_files = 1
+                    len_list = len(str(len(list_raw)))
+                    for file in list_raw:
+                        event_new = event
+                        event_new.name = os.path.basename(file)
+                        event_new.path = scan_path
+                        event_new.pathname = file
+                        self.parse_file_info(event_new)
+                        if len(self.info) > 0:
+
+                            # Check if this file has been recently dealt with
+                            if event_new.pathname not in self._deque:
+                                self._deque.append(event_new.pathname)
+                                info_multiple[str(cnt_files).zfill(len_list) + "_" + self.info['uid']] = self.info
+                                #info_multiple.append(self.info)
+                                cnt_files = cnt_files +1
+                            else:
+                                LOGGER.info("Data has been published recently, skipping.")
+                        self.__clean__()
+                    if len(info_multiple) > 0:
+                        self.info = info_multiple
+                        message = self.create_message(message_type='file_multiple')
+                        LOGGER.info("Publishing multi message %s", str(message))
+                        self.pub.send(str(message))
+
                 else:
                     LOGGER.debug("Cannot extract information from REF file")
             else:
@@ -225,10 +246,10 @@ class EventHandler(ProcessEvent):
                 pass
 
 
-    def create_message(self):
+    def create_message(self, message_type='file'):
         """Create broadcasted message
         """
-        return Message(self.topic, 'file', dict(self.info))
+        return Message(self.topic, message_type, dict(self.info))
 
     def parse_file_info(self, event):
         '''Parse satellite and orbit information from the filename.
@@ -357,6 +378,9 @@ def create_notifier(topic, instrument, posttroll_port, filepattern,
 
     # Add directories and event masks to watch manager
     for monitored_dir in monitored_dirs:
+        # directory creation
+        if not os.path.exists(monitored_dir):
+            os.makedirs(monitored_dir)
         manager.add_watch(monitored_dir, event_mask, rec=True)
 
     return notifier

@@ -205,6 +205,6 @@ def read_yaml(fname):
     import yaml
 
     with open(fname, 'r') as fid:
-        data = yaml.load(fid)
+        data = yaml.load(fid, Loader=yaml.SafeLoader)
 
     return data
