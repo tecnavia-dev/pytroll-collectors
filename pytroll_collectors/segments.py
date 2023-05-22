@@ -20,22 +20,22 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Gather GEO stationary segments, or polar satellite granules for one
-timestep, and send them in a bunch as a dataset.
+"""Gather segments.
+
+Gather GEO stationary segments, or polar satellite granules for one timestep,
+and send them in a bunch as a dataset.
 """
 
 import datetime as dt
 import logging
 import logging.handlers
-import os.path
-from six.moves.queue import Empty as queue_empty
-import time
+from six.moves.queue import Empty
 from collections import OrderedDict
-from six.moves.urllib.parse import urlparse, urlunparse
+from six.moves.urllib.parse import urlparse
 
 from posttroll import message, publisher
 from posttroll.listener import ListenerContainer
-from trollsift import Parser, compose
+from trollsift import Parser
 
 SLOT_NOT_READY = 0
 SLOT_NONCRITICAL_NOT_READY = 1
@@ -48,14 +48,13 @@ REMOVE_TAGS = {'path', 'segment'}
 
 
 class SegmentGatherer(object):
-
-    """Gatherer for geostationary satellite segments and multifile polar
-    satellite granules."""
+    """Gatherer for geostationary satellite segments and multifile polar satellite granules."""
 
     _listener = None
     _publisher = None
 
     def __init__(self, config):
+        """Initialize the segment gatherer."""
         self._config = config
         self._subject = None
         self._patterns = config['patterns']
@@ -76,13 +75,46 @@ class SegmentGatherer(object):
         self.logger = logging.getLogger("segment_gatherer")
         self._loop = False
 
+        # Convert check time into int minutes variables
+        for key in self._patterns:
+            if "hour_pattern" in self._patterns[key]:
+                time_conf = self._patterns[key]["hour_pattern"]
+                start_time_str = "00:00"
+                end_time_str = "23:59"
+                delta_time_str = "00:01"
+                if "start_time" in time_conf:
+                    start_time_str = time_conf["start_time"]
+                if "end_time" in time_conf:
+                    end_time_str = time_conf["end_time"]
+                if "delta_time" in time_conf:
+                    delta_time_str = time_conf["delta_time"]
+
+                start_h, start_m = start_time_str.split(':')
+                end_h, end_m = end_time_str.split(':')
+                delta_h, delta_m = delta_time_str.split(':')
+                hour = {}
+                hour["start"] = (60 * int(start_h)) + int(start_m)
+                hour["end"] = (60 * int(end_h)) + int(end_m)
+                hour["delta"] = (60 * int(delta_h)) + int(delta_m)
+
+                # Start-End time across midnight
+                hour["midnight"] = False
+                if hour["start"] > hour["end"]:
+                    hour["end"] += 24*60
+                    hour["midnight"] = True
+                self._patterns[key]["_hour_pattern"] = hour
+                self.logger.info("Hour pattern '%s' " +
+                                 "filter start:%s end:%s delta:%s",
+                                 key, start_time_str, end_time_str,
+                                 delta_time_str)
+
     def _clear_data(self, time_slot):
         """Clear data."""
         if time_slot in self.slots:
             del self.slots[time_slot]
 
     def _init_data(self, mda):
-        """Init wanted, all and critical files"""
+        """Init wanted, all and critical files."""
         # Init metadata struct
         metadata = mda.copy()
 
@@ -145,8 +177,9 @@ class SegmentGatherer(object):
 
     def _compose_filenames(self, key, time_slot, itm_str):
         """Compose filename set()s based on a pattern and item string.
-        itm_str is formated like ':PRO,:EPI' or 'VIS006:8,VIS008:1-8,...'"""
 
+        itm_str is formated like ':PRO,:EPI' or 'VIS006:8,VIS008:1-8,...'
+        """
         # Empty set
         result = set()
 
@@ -163,9 +196,17 @@ class SegmentGatherer(object):
         meta = _copy_without_ignore_items(meta,
                                           ignored_keys=var_tags)
 
+        parser = self._parsers[key]
+
         for itm in itm_str.split(','):
             channel_name, segments = itm.split(':')
             if channel_name == '' and segments == '':
+                # If the filename pattern has no segments/channels,
+                # add the "plain" globified filename to the filename
+                # set
+                if ('channel_name' not in parser.fmt and
+                        'segment' not in parser.fmt):
+                    result.add(parser.globify(meta))
                 continue
             segments = segments.split('-')
             if len(segments) > 1:
@@ -178,7 +219,7 @@ class SegmentGatherer(object):
             meta['channel_name'] = channel_name
             for seg in segments:
                 meta['segment'] = seg
-                fname = self._parsers[key].globify(meta)
+                fname = parser.globify(meta)
 
                 result.add(fname)
 
@@ -186,7 +227,6 @@ class SegmentGatherer(object):
 
     def _publish(self, time_slot, missing_files_check=True):
         """Publish file dataset and reinitialize gatherer."""
-
         data = self.slots[time_slot]
 
         # Diagnostic logging about delayed ...
@@ -231,6 +271,7 @@ class SegmentGatherer(object):
         self.logger = logger
 
     def update_timeout(self, time_slot):
+        """Update the timeout."""
         timeout = dt.datetime.utcnow() + self._timeliness
         self.slots[time_slot]['timeout'] = timeout
         self.logger.info("Setting timeout to %s for slot %s.",
@@ -272,7 +313,7 @@ class SegmentGatherer(object):
         return self.get_collection_status(status, slot['timeout'], time_slot)
 
     def get_collection_status(self, status, timeout, time_slot):
-        """Determine the overall status of the collection"""
+        """Determine the overall status of the collection."""
         if len(status) == 0:
             return SLOT_NOT_READY
 
@@ -312,20 +353,20 @@ class SegmentGatherer(object):
             return SLOT_READY_BUT_WAIT_FOR_MORE
 
     def _setup_messaging(self):
-        """Setup messaging"""
+        """Set up messaging."""
         self._subject = self._config['posttroll']['publish_topic']
         topics = self._config['posttroll'].get('topics')
         addresses = self._config['posttroll'].get('addresses')
         publish_port = self._config['posttroll'].get('publish_port', 0)
         nameservers = self._config['posttroll'].get('nameservers', [])
-        self._listener = ListenerContainer(topics=topics, addresses=addresses)
+        self._listener = ListenerContainer(topics=topics, addresses=addresses, nameserver=nameservers, services=[])
         self._publisher = publisher.NoisyPublisher("segment_gatherer",
                                                    port=publish_port,
                                                    nameservers=nameservers)
         self._publisher.start()
 
     def run(self):
-        """Run SegmentGatherer"""
+        """Run SegmentGatherer."""
         self._setup_messaging()
 
         self._loop = True
@@ -358,8 +399,17 @@ class SegmentGatherer(object):
             except KeyboardInterrupt:
                 self.stop()
                 continue
-            except queue_empty:
+            except Empty:
                 continue
+
+            if msg.type == "file_multiple":
+                self.logger.info("New message received: %s", str(msg))
+                tmp_msg_data = {}
+                for key in msg.data:
+                    tmp_msg_data[key] = msg.data[key]
+                for f in tmp_msg_data:
+                    msg.data = tmp_msg_data[f]
+                    self.process(msg)
 
             if msg.type == "file":
                 self.logger.info("New message received: %s", str(msg))
@@ -376,7 +426,7 @@ class SegmentGatherer(object):
             self._publisher.stop()
 
     def process(self, msg):
-        """Process message"""
+        """Process message."""
         mda = None
 
         try:
@@ -396,6 +446,17 @@ class SegmentGatherer(object):
 
         metadata = copy_metadata(mda, msg)
 
+        # Check if time of the raw is in scheduled range
+        if "_hour_pattern" in self._patterns[key]:
+            schedule_ok = self.check_schedule_time(
+                self._patterns[key]["_hour_pattern"],
+                metadata["start_time"].hour,
+                metadata["start_time"].minute)
+            if not schedule_ok:
+                self.logger.info("Hour pattern '%s' skip: %s",
+                                 key, msg.data["uid"])
+                return
+
         time_slot = self._find_time_slot(metadata["start_time"])
 
         # Init metadata etc if this is the first file
@@ -406,7 +467,7 @@ class SegmentGatherer(object):
         self.add_file(time_slot, key, mda, msg.data)
 
     def add_file(self, time_slot, key, mda, msg_data):
-        """Add file to the correct filelist"""
+        """Add file to the correct filelist."""
         uri = urlparse(msg_data['uri']).path
         uid = msg_data['uid']
         slot = self.slots[time_slot][key]
@@ -461,7 +522,7 @@ class SegmentGatherer(object):
         self.logger.info("%s processed", uid)
 
     def key_from_fname(self, uid):
-        """"""
+        """Get the keys from a filename."""
         for key in self._parsers:
             try:
                 _ = self._parsers[key].parse(uid)
@@ -470,8 +531,10 @@ class SegmentGatherer(object):
                 pass
 
     def _find_time_slot(self, time_obj):
-        """Find time slot and return the slot as a string.  If no slots are
-        close enough, return *str(time_obj)*"""
+        """Find time slot and return the slot as a string.
+
+        If no slots are close enough, return *str(time_obj)*
+        """
         for slot in self.slots:
             time_slot = self.slots[slot]['metadata'][self.time_name]
             time_diff = time_obj - time_slot
@@ -481,12 +544,26 @@ class SegmentGatherer(object):
 
         return str(time_obj)
 
+    def check_schedule_time(self, check_time, raw_hour, raw_minute):
+        # Check if raw time is inside configured interval
+        toret = False
+
+        # Convert check time into int variables
+        raw_time = (60 * raw_hour) + raw_minute
+        if check_time["midnight"] and raw_time < check_time["start"]:
+            raw_time += 24*60
+
+        # Check start and end time
+        if raw_time >= check_time["start"] and raw_time <= check_time["end"]:
+            # Raw time in range, check interval
+            if ((raw_time - check_time["start"]) % check_time["delta"]) == 0:
+                toret = True
+
+        return toret
+
 
 def _copy_without_ignore_items(the_dict, ignored_keys='ignore'):
-    """
-    get a copy of *the_dict* without entries having substring
-    'ignore' in key
-    """
+    """Get a copy of *the_dict* without entries having substring 'ignore' in key."""
     if not isinstance(ignored_keys, (list, tuple, set)):
         ignored_keys = [ignored_keys, ]
     new_dict = {}
@@ -562,7 +639,7 @@ def ini_to_dict(fname, section):
 
 
 def copy_metadata(mda, msg):
-    """Copy metada from filename and message to a combined dictionary"""
+    """Copy metada from filename and message to a combined dictionary."""
     metadata = {}
     # Use values parsed from the filename as basis
     for key in mda:

@@ -31,6 +31,10 @@ import pyinotify
 import sys
 import time
 from six.moves.configparser import RawConfigParser
+try:
+    import configparser as ConfigParser
+except ImportError:
+    import ConfigParser
 import logging
 import logging.config
 import os
@@ -54,11 +58,15 @@ class EventHandler(ProcessEvent):
      *topic* - topic of the published messages
      *posttroll_port* - port number to publish the messages on
      *filepattern* - filepattern for finding information from the filename
+
+     *ref_filepattern* - REF file filepattern name
     """
 
     def __init__(self, topic, instrument, posttroll_port=0, filepattern=None,
                  aliases=None, tbus_orbit=False, history=0, granule_length=0,
-                 custom_vars=None, nameservers=[], watchManager=None):
+                 custom_vars=None, nameservers=[], watchManager=None,
+                 ref_filepattern=None):
+
         super(EventHandler, self).__init__()
 
         self._pub = NoisyPublisher("trollstalker", posttroll_port, topic,
@@ -77,6 +85,10 @@ class EventHandler(ProcessEvent):
         self._deque = deque([], history)
         self._watchManager = watchManager
         self._watched_dirs = dict()
+        if ref_filepattern is not None:
+            self.ref_file_parser = Parser(ref_filepattern)
+        else:
+            self.ref_file_parser = None
 
     def stop(self):
         '''Stop publisher.
@@ -135,37 +147,109 @@ class EventHandler(ProcessEvent):
                 LOGGER.warning("Dir {} not watched by inotify. Can not delete watch.".format(event.pathname))
         return
 
+    def sort_epilog(self, elem):
+        mod_time = os.path.getmtime(elem)
+        if elem.lower().find("epi") != -1:
+            mod_time += 3600
+        return mod_time
+
     def process(self, event):
-        '''Process the event'''
+        '''Process the event
+
+            - Send a message if event is triggered on a satellite data file
+            - If use of REF file is configured and event is triggered on a REF file:
+                Read the referenced directory from the ref file and send messages for all data inside the
+                referenced directory
+
+                REF file internal format:
+                [REF]
+                SourcePath = /path/to/dataset
+                FileName = ref_file_filename
+        '''
+
         # New file created and closed
         if not event.dir:
             LOGGER.debug("processing %s", event.pathname)
-            # parse information and create self.info OrderedDict{}
-            self.parse_file_info(event)
-            if len(self.info) > 0:
-                # Check if this file has been recently dealt with
-                if event.pathname not in self._deque:
-                    self._deque.append(event.pathname)
-                    message = self.create_message()
-                    LOGGER.info("Publishing message %s", str(message))
-                    self.pub.send(str(message))
+
+            if self.ref_file_parser is not None and self.ref_file_parser.validate(event.pathname):
+                # It is a REF file
+                # Generate messages for files found in referenced directory
+                event_file = event.pathname
+                LOGGER.info("Found REF file: %s", str(event_file))
+                ref_file_content = parse_ref_file(event_file)
+                if "REF" in ref_file_content and "sourcepath" in ref_file_content["REF"]:
+                    scan_path = ref_file_content["REF"]["sourcepath"]
+                    LOGGER.info("Generating messages for referenced path: %s", str(scan_path))
+                    # use Filter to trigger file in referenced directory
+                    if "filter" in ref_file_content["REF"]:
+                        filter_ref = ref_file_content["REF"]["filter"]
+                    else:
+                        filter_ref = ".*"
+
+                    # scan all files in referenced folder and generate messages for all the files
+                    list_raw = [os.path.join(scan_path, f) for f in os.listdir(scan_path) if os.path.isfile(os.path.join(scan_path, f)) and re.search(filter_ref, f)]
+                    list_raw = sorted(list_raw, key=self.sort_epilog)
+                    info_multiple = OrderedDict()
+                    cnt_files = 1
+                    len_list = len(str(len(list_raw)))
+                    for file in list_raw:
+                        event_new = event
+                        event_new.name = os.path.basename(file)
+                        event_new.path = scan_path
+                        event_new.pathname = file
+                        self.parse_file_info(event_new)
+                        if len(self.info) > 0:
+
+                            # Check if this file has been recently dealt with
+                            if event_new.pathname not in self._deque:
+                                self._deque.append(event_new.pathname)
+                                info_multiple[str(cnt_files).zfill(len_list) + "_" + self.info['uid']] = self.info
+                                #info_multiple.append(self.info)
+                                cnt_files = cnt_files +1
+                            else:
+                                LOGGER.info("Data has been published recently, skipping.")
+                        self.__clean__()
+                    if len(info_multiple) > 0:
+                        self.info = info_multiple
+                        message = self.create_message(message_type='file_multiple')
+                        LOGGER.info("Publishing multi message %s", str(message))
+                        self.pub.send(str(message))
+
                 else:
-                    LOGGER.info("Data has been published recently, skipping.")
+                    LOGGER.debug("Cannot extract information from REF file")
+            else:
+                # parse information and create self.info OrderedDict{}
+                self.parse_file_info(event)
+                if len(self.info) > 0:
+                    # Check if this file has been recently dealt with
+                    if event.pathname not in self._deque:
+                        self._deque.append(event.pathname)
+                        message = self.create_message()
+                        LOGGER.info("Publishing message %s", str(message))
+                        self.pub.send(str(message))
+                    else:
+                        LOGGER.info("Data has been published recently, skipping.")
             self.__clean__()
         elif (event.mask & pyinotify.IN_ISDIR):
             tmask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO |
                      pyinotify.IN_CREATE | pyinotify.IN_DELETE)
             try:
+                # If watched mask has been configured in cfg, use the configured one
+                if self._watchManager._wmd is not None:
+                    for wmd in self._watchManager._wmd:
+                        tmask = self._watchManager._wmd[wmd].mask
+                        break
                 self._watched_dirs.update(self._watchManager.add_watch(event.pathname, tmask))
                 LOGGER.debug("Added watch on dir: {}".format(event.pathname))
             except AttributeError:
                 LOGGER.error("No watchmanager given. Can not add watch on {}".format(event.pathname))
                 pass
 
-    def create_message(self):
+
+    def create_message(self, message_type='file'):
         """Create broadcasted message
         """
-        return Message(self.topic, 'file', dict(self.info))
+        return Message(self.topic, message_type, dict(self.info))
 
     def parse_file_info(self, event):
         '''Parse satellite and orbit information from the filename.
@@ -262,7 +346,7 @@ class NewThreadedNotifier(ThreadedNotifier):
 def create_notifier(topic, instrument, posttroll_port, filepattern,
                     event_names, monitored_dirs, aliases=None,
                     tbus_orbit=False, history=0, granule_length=0,
-                    custom_vars=None, nameservers=[]):
+                    custom_vars=None, nameservers=[], ref_filepattern=None):
     '''Create new notifier'''
 
     # Event handler observes the operations in defined folder
@@ -287,12 +371,16 @@ def create_notifier(topic, instrument, posttroll_port, filepattern,
                                  granule_length=granule_length,
                                  custom_vars=custom_vars,
                                  nameservers=nameservers,
-                                 watchManager=manager)
+                                 watchManager=manager,
+                                 ref_filepattern = ref_filepattern)
 
     notifier = NewThreadedNotifier(manager, event_handler)
 
     # Add directories and event masks to watch manager
     for monitored_dir in monitored_dirs:
+        # directory creation
+        if not os.path.exists(monitored_dir):
+            os.makedirs(monitored_dir)
         manager.add_watch(monitored_dir, event_mask, rec=True)
 
     return notifier
@@ -317,6 +405,26 @@ def parse_vars(config):
             var = config[key]
             vars[new_key] = var
     return vars
+
+def parse_ref_file(ref_filename):
+    """ Parse REF file and return dictionary of the ref file content
+    """
+    reference_path = None
+    ref_info = dict()
+    try:
+        ref_file = RawConfigParser()
+        ref_file.read(ref_filename)
+        for section in ref_file.sections():
+            temp_dict = dict()
+            for (key, val) in ref_file.items(section):
+                temp_dict.update({key : val})
+            ref_info.update({section : temp_dict})
+
+    except ConfigParser.MissingSectionHeaderError:
+        LOGGER.error("Wrong ref file format: " + str(ref_filename))
+    except ConfigParser.ParsingError:
+        LOGGER.error("Error parsing ref file: " + str(ref_filename))
+    return ref_info
 
 
 def main():
@@ -386,6 +494,8 @@ def main():
     if args.filepattern == '':
         filepattern = None
 
+    ref_filepattern = None
+
     if args.configuration_file is not None:
         config_fname = args.configuration_file
 
@@ -428,6 +538,11 @@ def main():
             nameservers = nameservers or config['nameservers']
         except KeyError:
             nameservers = []
+
+        try:
+            ref_filepattern = ref_filepattern or config['ref_filepattern']
+        except KeyError:
+            pass
 
         aliases = helper_functions.parse_aliases(config)
         tbus_orbit = bool(config.get("tbus_orbit", False))
@@ -475,7 +590,8 @@ def main():
                                tbus_orbit=tbus_orbit, history=history,
                                granule_length=granule_length,
                                custom_vars=custom_vars,
-                               nameservers=nameservers)
+                               nameservers=nameservers,
+                               ref_filepattern=ref_filepattern)
     notifier.start()
 
     try:
